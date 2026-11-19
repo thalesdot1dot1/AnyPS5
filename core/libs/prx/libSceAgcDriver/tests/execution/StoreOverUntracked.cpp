@@ -279,22 +279,22 @@ struct Case {
 };
 
 enum class Outcome { Kept, Lost, Missed };
+enum class SecondStoreCase { LeavesWatch, AlwaysUnwatched };
 
-// The surface is outside the write watch from the start. Its first results are stored, which
-// leaves their bytes saved for the next store to compare with; the CPU writes another block, then
-// the next results land and are stored: the CPU's block was written after the first store, so it
-// keeps the CPU's bytes as the write watch would keep them.
-Outcome RunSecondStore(const char* name) {
-    Surface surface(true);
+Outcome RunSecondStore(const char* name, SecondStoreCase test) {
+    const bool startsWatched = test == SecondStoreCase::LeavesWatch;
+    Surface surface(startsWatched);
     struct WaitForWork {
         ~WaitForWork() { AgcDriverWaitIdle_nid_postfix(); }
     } waitForWork;
     const auto address = surface.Address();
-    if (!AgcDriver::GuestMemory::Watched(address, SurfaceBytes)) {
-        std::fprintf(stderr, "[store over untracked] %s: not run, the surface is not write-watched\n", name);
-        return Outcome::Kept;
+    if (startsWatched) {
+        if (!AgcDriver::GuestMemory::Watched(address, SurfaceBytes)) {
+            std::fprintf(stderr, "[store over untracked] %s: not run, the surface is not write-watched\n", name);
+            return Outcome::Kept;
+        }
+        AgcDriver::GuestMemory::Unwatch(address, SurfaceBytes);
     }
-    AgcDriver::GuestMemory::Unwatch(address, SurfaceBytes);
     Require(!AgcDriver::GuestMemory::Watched(address, SurfaceBytes), "store over untracked: the surface is still write-watched");
     std::unique_lock hold(AgcDriver::GuestMemory::GpuMutex(), std::defer_lock);
     const auto heldLive = [&](std::uint32_t result) {
@@ -324,6 +324,7 @@ Outcome RunSecondStore(const char* name) {
     const bool rewatched = AgcDriver::GuestMemory::Watched(address, SurfaceBytes);
     hold.unlock();
     Require(image != nullptr, "store over untracked: the surface has no storage image");
+    Require(startsWatched || !rewatched, "store over untracked: the unwatched surface entered the write watch after its first store");
     if (rewatched) {
         std::fprintf(stderr, "[store over untracked] %s: the surface is under the write watch again, which tracks its second store\n", name);
     } else if (!saved) {
@@ -334,13 +335,17 @@ Outcome RunSecondStore(const char* name) {
     for (std::size_t offset = 0; offset < Page; ++offset) static_cast<volatile std::uint8_t*>(written)[offset] = Pattern(offset);
     Store(surface.Texels(), Side, StoreAgainCode);
     if (!heldLive(StoredAgain)) return Outcome::Missed;
+    Require(startsWatched || !AgcDriver::GuestMemory::Watched(address, SurfaceBytes), "store over untracked: the unwatched surface entered the write watch before its second write-back");
     StorageTexture::FlushAllPending("store over untracked fixture");
     hold.unlock();
     std::vector<std::byte> whole(SurfaceBytes);
     AgcDriver::GuestMemory::Read(address, whole);
     Require(static_cast<const volatile std::uint32_t*>(surface.Texels())[0] == StoredAgain, "store over untracked: the second result did not reach a block the CPU left alone");
     const auto lost = LostBytes(written);
-    if (lost == 0) return Outcome::Kept;
+    if (lost == 0) {
+        std::printf("[store over untracked] %s: preserved all CPU-written bytes\n", name);
+        return Outcome::Kept;
+    }
     std::fprintf(stderr, "[store over untracked] %s: of 0x%zx bytes the CPU wrote between the two stores, %zu were lost\n", name, Page, lost);
     return Outcome::Lost;
 }
@@ -564,10 +569,10 @@ int main(int argc, char** argv) {
             Require(outcome != Outcome::Missed, "store over untracked: the result was never held pending");
             kept = outcome == Outcome::Kept && kept;
         }
-        {
-            constexpr auto name = "a second store over a surface outside the write watch";
+        for (const auto& [test, name] : {std::pair{SecondStoreCase::LeavesWatch, "a second store over a surface that left the write watch"},
+                                        std::pair{SecondStoreCase::AlwaysUnwatched, "a second store over a surface never in the write watch"}}) {
             auto outcome = Outcome::Missed;
-            for (std::uint32_t attempt = 0; attempt < 256u && outcome == Outcome::Missed; ++attempt) outcome = RunSecondStore(name);
+            for (std::uint32_t attempt = 0; attempt < 256u && outcome == Outcome::Missed; ++attempt) outcome = RunSecondStore(name, test);
             Require(outcome != Outcome::Missed, "store over untracked: the result was never held pending");
             kept = outcome == Outcome::Kept && kept;
         }
