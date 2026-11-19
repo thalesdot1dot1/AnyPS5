@@ -321,9 +321,12 @@ Outcome RunSecondStore(const char* name) {
     hold.lock();
     const auto image = StorageTexture::FindLive(address, SurfaceBytes);
     const bool saved = image != nullptr && image->GuestSnapshotValid();
+    const bool rewatched = AgcDriver::GuestMemory::Watched(address, SurfaceBytes);
     hold.unlock();
     Require(image != nullptr, "store over untracked: the surface has no storage image");
-    if (!saved) {
+    if (rewatched) {
+        std::fprintf(stderr, "[store over untracked] %s: the surface is under the write watch again, which tracks its second store\n", name);
+    } else if (!saved) {
         std::fprintf(stderr, "[store over untracked] %s: the store left no saved guest bytes\n", name);
         return Outcome::Lost;
     }
